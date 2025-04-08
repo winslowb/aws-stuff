@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# Define the report file name
+report_file="$HOME/awsjson/log/budgets-report_${profile}-$(date +%Y-%m-%d-%H-%M-%S).md"
+
+# Extract profile names from $HOME/.aws/credentials
+profile_list=$(grep -o '\[\(.*\)\]' $HOME/.aws/credentials | tr -d '[]')
+IFS=$'\n' read -rd '' -a profiles <<<"$profile_list"
+profiles+=("All")  # Add an "All" option to the profiles array
+
+# Prompt user to choose a profile
+echo -e "\033[0;32mProfiles:\033[0m"
+for i in "${!profiles[@]}"; do
+   printf "%d. %s\n" $((i+1)) "${profiles[$i]}"
+done
+read -p "Choose a profile: " choice
+selected_profile=${profiles[$((choice-1))]}
+
+# Remove any existing report file
+rm -f "$report_file"
+
+# Get the current date
+current_date=$(date +%Y-%m-%d)
+
+# Add the date to the report
+echo "# Budget Report - $current_date" >> "$report_file"
+echo "" >> "$report_file"
+
+# Define the column headers
+echo "| Profile | Budget Name | Actual Spend | Budget Limit | Percentage Consumed |" >> "$report_file"
+echo "| ------- | ----------- | ------------ | ------------ | ------------------ |" >> "$report_file"
+
+# Function to process a single profile
+process_profile() {
+    local profile=$1
+    echo "Profile: $profile"
+    # Get the account ID for the current profile
+    account_id=$(aws sts get-caller-identity --profile "$profile" --query "Account" --output text)
+    # Get the budgets for the current account
+    budget_output=$(aws budgets describe-budgets --account-id "$account_id" --profile "$profile")
+    # Extract the relevant budget details from the output
+    budget_name=$(echo "$budget_output" | jq -r '.Budgets[0].BudgetName')
+    budget_amount=$(echo "$budget_output" | jq -r '.Budgets[0].CalculatedSpend.ActualSpend.Amount')
+    budget_currency=$(echo "$budget_output" | jq -r '.Budgets[0].CalculatedSpend.ActualSpend.Unit')
+    budget_limit=$(echo "$budget_output" | jq -r '.Budgets[0].BudgetLimit.Amount')
+
+    if [[ "$budget_amount" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ "$budget_limit" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        # Calculate the percentage of the allocated budget consumed
+        percentage_consumed=$(echo "scale=2; $budget_amount/$budget_limit*100" | bc)
+    else
+        echo "Error: Invalid budget amount or limit for profile $profile. Skipping..."
+        return
+    fi
+    
+    # Format the budget amount, budget limit, and percentage consumed with the $ and % symbols
+    budget_amount_formatted=$(printf '$%s' "$budget_amount")
+    budget_limit_formatted=$(printf '$%s' "$budget_limit")
+    percentage_consumed_formatted=$(printf '%s%%' "$percentage_consumed")
+    # Output the budget details to the report file
+    echo "| $profile | $budget_name | $budget_amount_formatted | $budget_limit_formatted | $percentage_consumed_formatted |" >> "$report_file"
+}
+
+# Check if user selected "All" or a specific profile
+if [ "$selected_profile" == "All" ]; then
+    for profile in "${profiles[@]}"; do
+        if [ "$profile" != "All" ]; then
+            process_profile "$profile"
+        fi
+    done
+else
+    process_profile "$selected_profile"
+fi

@@ -1,0 +1,81 @@
+#!/bin/bash
+
+# Define location of AWS profiles
+profile_list=$(grep -o '\[\(.*\)\]' $HOME/.aws/credentials | tr -d '[]')
+
+# Get the profile names from the file
+IFS=$'\n' read -rd '' -a profiles <<<"$profile_list"
+
+# Add an "All" option to the profiles array
+profiles+=("All")
+
+# Ask the user to choose a profile
+echo -e "\033[0;32mProfiles:\033[0m"
+for i in "${!profiles[@]}"; do
+   printf "%d. %s\n" $((i+1)) "${profiles[$i]}"
+done
+read -p "Choose a profile:" choice
+profile=${profiles[$((choice-1))]}
+
+# Ask the user to choose a time period
+read -p "Enter the start date (yyyy-mm-dd):" start_date
+read -p "Enter the end date (yyyy-mm-dd):" end_date
+
+# Ask the user to choose the granularity
+echo -e "\033[2;38mGranularity:\033[0m"
+echo -e "\033[2;38m1. HOURLY\033[0m"
+echo -e "\033[2;38m2. DAILY\033[0m"
+echo -e "\033[2;38m3. MONTHLY\033[0m"
+read -p "Choose a granularity: " granularity_choice
+
+# If HOURLY granularity, ask for time too
+if [ "$granularity_choice" -eq 1 ]; then
+echo -e "\033[0;32mHourly has some limititation; AWS keeps about 15 days of hourly metrics\033[0m"
+    read -p "Enter the start time (hh:mm:ss):" start_time
+    read -p "Enter the end time (hh:mm:ss):" end_time
+    start_date="${start_date}T${start_time}Z"
+    end_date="${end_date}T${end_time}Z"
+fi
+
+# Map input to AWS granularity
+case "$granularity_choice" in
+  1) granularity="HOURLY";;
+  2) granularity="DAILY";;
+  3) granularity="MONTHLY";;
+  *) echo "Invalid choice"; exit 1;;
+esac
+
+# Prepare the report file
+report_file="$HOME/awsjson/log/${profile}_${start_date}_to_${end_date}_${granularity}.md"
+
+echo "# AWS Cost Explorer Report for ${profile} - ${start_date} to ${end_date}" > "$report_file"
+echo "" >> "$report_file"
+echo "| Profile | Date       | Usage Type                                    | Amount |" >> "$report_file"
+echo "|---------|------------|-----------------------------------------------|--------|" >> "$report_file"
+
+# Create filter.json for EC2 - Other
+echo '{"Dimensions": {"Key": "SERVICE", "Values": ["EC2 - Other"]}}' > filter.json
+# Get cost and usage data
+if [ "$profile" == "All" ]; then
+    # If the user chose "All", loop over all profiles
+    for profile in "${profiles[@]}"; do
+        if [ "$profile" != "All" ]; then
+            output=$(aws ce get-cost-and-usage --profile "${profile}" --time-period Start="${start_date}",End="${end_date}" --granularity "$granularity" --filter file://filter.json --metrics "BlendedCost" --group-by Type=DIMENSION,Key=USAGE_TYPE)
+            echo "$output" | jq -r --arg profile "$profile" '.ResultsByTime[] | .TimePeriod.Start as $date | .Groups[] | "| \($profile) | \($date) | \(.Keys[0]) | $\(.Metrics.BlendedCost.Amount) |"' | while read line; do
+                echo "$line" >> "$report_file"
+            done
+        fi
+    done
+else
+    # If the user chose a specific profile, get data for that profile only
+    output=$(aws ce get-cost-and-usage --profile "${profile}" --time-period Start="${start_date}",End="${end_date}" --granularity "$granularity" --filter file://filter.json --metrics "BlendedCost" --group-by Type=DIMENSION,Key=USAGE_TYPE)
+    echo "$output" | jq -r --arg profile "$profile" '.ResultsByTime[] | .TimePeriod.Start as $date | .Groups[] | "| \($profile) | \($date) | \(.Keys[0]) | $\(.Metrics.BlendedCost.Amount) |"' | while read line; do
+        echo "$line" >> "$report_file"
+    done
+fi
+
+# Remove filter.json
+rm filter.json
+
+echo -e "\033[0;32mReport saved to $report_file\033[0m"
+

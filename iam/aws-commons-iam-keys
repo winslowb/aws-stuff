@@ -1,0 +1,184 @@
+#!/bin/bash 
+#
+# Description: Manages IAM keys for specific commons.
+# Tags: iam access keys compliance
+# Date: 2023-11-01
+# Version 0.1.1
+
+YELLOW='\033[1;33m'
+LIGHT_RED='\033[1;31m'
+NC='\033[0m' # No Color
+
+# Function to log actions to the report
+log_to_report() {
+  echo "$1" >> $report
+}
+
+# Modified function to ask for one or many AWS profiles
+ask_profiles() {
+  echo -e "${YELLOW}Available AWS profiles:${NC}"
+  mapfile -t profiles < <(grep "\[" $HOME/.aws/credentials | sed 's/\[\|\]//g')
+  for i in "${!profiles[@]}"; do
+    echo "$((i+1)). ${profiles[i]}"
+  done
+  
+  echo -e "${YELLOW}Enter the number(s) for the profile(s) you wish to select, separated by spaces, or type 'all' to select all profiles:${NC}"
+  read -r profile_selection
+  
+  if [[ "$profile_selection" == "all" ]]; then
+    profile_input=("${profiles[@]}")
+  else
+    IFS=' ' read -r -a selected_indices <<< "$profile_selection"
+    for index in "${selected_indices[@]}"; do
+      ((index--)) # Adjust index to 0-based array indexing
+      if [[ index -ge 0 && index -lt ${#profiles[@]} ]]; then
+        profile_input+=("${profiles[index]}")
+      else
+        echo -e "${LIGHT_RED}Invalid selection: $index. Please try again.${NC}"
+        ask_profiles # Recursively call ask_profiles to correct the mistake
+        return
+      fi
+    done
+  fi
+  echo -e "${YELLOW}Selected profile(s): ${profile_input[*]}${NC}"
+}
+
+# Initialize the selection of profiles
+ask_profiles
+
+# Loop through each selected profile to perform actions
+for profile in "${profile_input[@]}"; do
+  echo -e "${YELLOW}Processing IAM keys for profile: $profile${NC}"
+  
+  # Set the AWS region
+  region=us-east-1
+  
+  # Create a log directory for the profile
+  mkdir -p "$HOME/awsjson/log/$profile"
+  report="$HOME/awsjson/log/$profile/iam-keys-report-$(date +%F).md"
+
+  # Choose the source of IAM users for the selected profile
+echo -e "${LIGHT_RED}Select the source of IAM users for profile $profile:${NC}"
+select source in "From AWS Profile" "From File"; do
+    case $source in
+        "From AWS Profile")
+            echo -e "${YELLOW}Fetching users from AWS profile $profile...${NC}"
+            users=($(aws iam list-users --profile "$profile" --region $region --output text --query 'Users[*].UserName'))
+            if [ $? -ne 0 ]; then
+                echo -e "${LIGHT_RED}Failed to fetch users from profile $profile. Please check your AWS CLI setup and permissions.${NC}"
+                exit 1
+            fi
+            break;;
+        "From File")
+            echo -e "${YELLOW}Enter the full path to the file containing IAM user names:${NC}"
+            read user_list_file
+            if [[ -s $user_list_file ]]; then
+                IFS=$'\n' read -d '' -r -a users < $user_list_file
+            else
+                echo -e "${LIGHT_RED}User list file not found or empty. Please check the file: $user_list_file${NC}"
+                exit 1
+            fi
+            break;;
+        *)
+            echo -e "${LIGHT_RED}Invalid selection. Please try again.${NC}"
+            ;;
+    esac
+done
+  
+# Display the list of IAM users and allow for selection
+  echo -e "${YELLOW}List of IAM users:${NC}"
+  count=0
+  declare -a display_users # Array to hold users for display
+  for user in "${users[@]}"; do
+    if [[ "$user" != "bwinslow" && "$user" != "datadogintegration-FR" ]]; then # Exclude specific users
+      display_users+=("$user")
+      echo "$((++count)). $user"
+    fi
+  done
+
+  declare -a selected_users # Array to hold selected users for management
+  while :; do
+    echo -e "${YELLOW}Enter the numbers of the IAM users to manage (separated by spaces), 'all' for all users, or 'done' when finished:${NC}"
+    read user_input
+    if [[ $user_input == 'all' ]]; then
+      selected_users=("${display_users[@]}")
+      break
+    elif [[ $user_input == 'done' ]]; then
+      break
+    else
+      IFS=' ' read -r -a user_indices <<< "$user_input"
+      for index in "${user_indices[@]}"; do
+        if [[ $index -ge 1 && $index -le ${#display_users[@]} ]]; then
+          selected_users+=("${display_users[$index-1]}")
+        else
+          echo -e "${LIGHT_RED}Invalid selection: $index. Please try again.${NC}"
+        fi
+      done
+      if [[ ${#selected_users[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}You have selected the following users for management:${NC}"
+        printf '%s\n' "${selected_users[@]}"
+        break
+      fi
+    fi
+  done
+
+  # Prompt for the action to be performed on the selected IAM users
+  echo -e "${YELLOW}Enter the action to perform on the selected IAM users (disable-key, delete-key, create-key, enable-key, inventory, delete-user):${NC}"
+  read action
+
+  # Iterate over each selected user to perform the specified action
+  for iam_user in "${selected_users[@]}"; do
+    case $action in
+      "disable-key")
+        # Disable all active access keys for the IAM user
+        keys_json=$(aws iam list-access-keys --profile "$profile" --region $region --user-name "$iam_user" --output json)
+        key_ids=($(echo "$keys_json" | jq -r '.AccessKeyMetadata[].AccessKeyId'))
+        for key_id in "${key_ids[@]}"; do
+          aws iam update-access-key --profile "$profile" --region $region --user-name "$iam_user" --access-key-id "$key_id" --status Inactive
+          log_to_report "| $iam_user | Disabled Key | $key_id | | | | | | Inactive |"
+        done
+        ;;
+      "delete-key")
+        # Delete all access keys for the IAM user
+        for key_id in "${key_ids[@]}"; do
+          aws iam delete-access-key --profile "$profile" --region $region --user-name "$iam_user" --access-key-id "$key_id"
+          log_to_report "| $iam_user | Deleted Key | $key_id | | | | | | Deleted |"
+        done
+        ;;
+      "create-key")
+        # Create a new access key for the IAM user
+        key_json=$(aws iam create-access-key --profile "$profile" --region $region --user-name "$iam_user" --output json)
+        key_id=$(echo "$key_json" | jq -r '.AccessKey.AccessKeyId')
+        secret=$(echo "$key_json" | jq -r '.AccessKey.SecretAccessKey')
+        log_to_report "| $iam_user | Created Key | | $key_id | $secret | $(date +%F) | | | Active |"
+        ;;
+      "enable-key")
+        # Enable a specific access key for the IAM user
+        echo -e "${YELLOW}Enter the Access Key ID to enable for $iam_user:${NC}"
+        read key_id
+        aws iam update-access-key --profile "$profile" --region $region --user-name "$iam_user" --access-key-id "$key_id" --status Active
+        log_to_report "| $iam_user | Enabled Key | $key_id | | | | | | Active |"
+        ;;
+      "inventory")
+        # List all access keys and their status for the IAM user
+        keys_json=$(aws iam list-access-keys --profile "$profile" --region $region --user-name "$iam_user" --output json)
+        echo "$keys_json" | jq -r '.AccessKeyMetadata[] | "\(.UserName) | Inventory | \(.AccessKeyId) | | | \(.CreateDate) | | | \(.Status) |"' | while read line; do
+          log_to_report "$line"
+        done
+        ;;
+      "delete-user")
+        # Delete the IAM user
+        aws iam delete-user --profile "$profile" --region $region --user-name "$iam_user"
+        log_to_report "| $iam_user | Deleted User | | | | | | | Deleted |"
+        ;;
+      *)
+        echo -e "${LIGHT_RED}Invalid action. Please restart the script and try again.${NC}"
+        exit 1
+        ;;
+    esac
+  done
+
+  echo -e "${YELLOW}Report has been saved to $report${NC}"
+done
+
+echo -e "${YELLOW}All selected profiles have been processed.${NC}"
