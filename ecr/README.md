@@ -1,4 +1,4 @@
-🐳 ### create_ecr_repo_and_creds.py
+🐳 ### create_ecr_repo_and_creds.py (https://github.com/winslowb/aws-stuff/ecr)
 
 A realistic, mildly frustrated, slightly festive tool to create AWS IAM roles and ECR repositories so users can push Docker images—without having to do everything manually. Meant for internal dev workflows where people just need creds and a place to push containers.
 
